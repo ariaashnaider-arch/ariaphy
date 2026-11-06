@@ -13,7 +13,7 @@ from wsproto.utilities import LocalProtocolError, RemoteProtocolError
 
 from edge_config import valid_domain
 
-CHUNK = 32768
+CHUNK = 64 * 1024
 HEADER_TIMEOUT = 10
 IO_TIMEOUT = 4
 IDLE_SECONDS = 120
@@ -78,6 +78,13 @@ def read_target(data):
     return Target(host, port, end)
 
 
+def disable_nagle(stream):
+    try:
+        stream.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except (AttributeError, OSError, NotImplementedError):
+        pass  # Some runtimes do not expose this socket option.
+
+
 def connect_public(host, port):
     # Resolve once, then dial the exact validated IP to avoid a second lookup.
     try:
@@ -109,6 +116,7 @@ def connect_public(host, port):
         try:
             upstream.settimeout(IO_TIMEOUT)
             upstream.connect(endpoint)
+            disable_nagle(upstream)
             return upstream
         except (OSError, NotImplementedError) as error:
             last_error = error
@@ -231,8 +239,11 @@ class Tunnel:
         except Exception as error:
             self.finish(1011, "tunnel-runtime", error)
 
-    def run(self):
+    def run(self, reader=None):
         self.client.settimeout(IO_TIMEOUT)
+        disable_nagle(self.client)
+        # The HTTP reader may already contain bytes of the first WS frame.
+        read = self.client.recv if reader is None else reader.read1
         while not self.stopped.is_set():
             now = time.monotonic()
             if self.upstream is None and now - self.started >= HEADER_TIMEOUT:
@@ -245,8 +256,11 @@ class Tunnel:
                 self.finish(1000, "session-ended")
                 return
             try:
-                data = self.client.recv(CHUNK)
+                data = read(CHUNK)
             except TimeoutError:
+                # read1 only reaches the socket when its buffer is empty. A
+                # timed-out SocketIO can't be read again, so resume at the socket.
+                read = self.client.recv
                 continue
             if not data:
                 self.finish(1000, "client-eof")
@@ -267,10 +281,10 @@ class Tunnel:
         self.upstream.close()
 
 
-def relay(client, protocol, config):
+def relay(client, protocol, config, *, reader=None):
     tunnel = Tunnel(client, protocol, config)
     try:
-        tunnel.run()
+        tunnel.run(reader)
     except TunnelPolicyError:
         tunnel.finish(1008, "connection-rejected")
     except OutboundError as error:

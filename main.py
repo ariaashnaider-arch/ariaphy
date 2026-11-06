@@ -87,8 +87,6 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "AriaWasmer/1.0"
     sys_version = ""
     timeout = 8
-    # The upgrade switches to socket reads, so don't buffer bytes past HTTP headers.
-    rbufsize = 0
 
     def log_message(self, *_args):
         pass
@@ -250,7 +248,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.error(400, "درخواست ارتقای WebSocket معتبر نیست.")
                 return
             self.connection.sendall(response)
-            relay(self.connection, protocol, self.config)
+            relay(self.connection, protocol, self.config, reader=self.rfile)
         except OSError:
             pass
         finally:
