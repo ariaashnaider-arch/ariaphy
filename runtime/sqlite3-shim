@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "$ARIA_SQLITE_PYTHON" "$ARIA_SQLITE_HELPER" "$@"
