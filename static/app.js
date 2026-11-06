@@ -131,9 +131,14 @@ byId('test').addEventListener('click', event => {
   let received = [];
   let finished = false;
   let upgraded = false;
-  const timer = setTimeout(() => finish(upgraded
-    ? 'WebSocket باز شد. مقصد آزمایشی پاسخ نداد.'
-    : 'درخواست WebSocket در مهلت آزمایش باز نشد.'), 20000);
+  let connected = false;
+  const timeoutMessage = () => {
+    if (connected) return 'TCP به مقصد آزمایشی وصل شد. پاسخ HTTP در مهلت تست نرسید.';
+    return upgraded
+      ? 'WebSocket باز شد. تأیید اتصال خروجی در مهلت تست نرسید.'
+      : 'درخواست WebSocket در مهلت آزمایش باز نشد.';
+  };
+  const timer = setTimeout(() => finish(timeoutMessage()), 22000);
 
   function finish(message) {
     if (finished) return;
@@ -153,6 +158,8 @@ byId('test').addEventListener('click', event => {
     received = received.concat(Array.from(new Uint8Array(event.data).slice(0, 128))).slice(0, 128);
     if (received.length < 2) return;
     if (received[0] !== 0 || received[1] !== 0) return finish('پاسخ VLESS معتبر نبود.');
+    connected = true;
+    if (profile === activeProfile) result.textContent = 'TCP وصل شد. در انتظار پاسخ HTTP مقصد…';
     const reply = new TextDecoder().decode(Uint8Array.from(received.slice(2)));
     const status = /^HTTP\/1\.[01] (\d{3})\b/.exec(reply);
     if (status) finish(`ارتباط برقرار شد. پاسخ HTTP ${status[1]} از example.com رسید.`);
@@ -161,9 +168,25 @@ byId('test').addEventListener('click', event => {
     if (!upgraded) finish('WebSocket باز نشد. دامنه و استقرار Wasmer را بررسی کن.');
   });
   ws.addEventListener('close', event => {
-    if (event.code === 1008) return finish('اتصال رد شد. لینک تازه بساز و دوباره امتحان کن.');
-    if (event.code === 1011) return finish('WebSocket باز شد. اتصال خروجی سرور به مقصد آزمایشی برقرار نشد.');
-    finish(upgraded ? 'WebSocket باز شد و پیش از پاسخ مقصد بسته شد.' : 'برقراری WebSocket ناموفق بود.');
+    const byReason = {
+      'first-frame-timeout': 'WebSocket باز شد اما سرور اولین بستهٔ داده را دریافت نکرد.',
+      'header-timeout': 'بخشی از بستهٔ VLESS رسید و سرآیند کامل نشد.',
+      'invalid-profile': 'کانفیگ رد شد. یک لینک تازه بساز و دوباره تست کن.',
+      'expired-profile': 'اعتبار کانفیگ تمام شده است. یک لینک تازه بساز.',
+      'connection-rejected': 'درخواست VLESS یا مقصد از طرف پنل رد شد.',
+      'outbound-dns': 'WebSocket باز شد اما DNS سرور نتوانست IP مقصد را پیدا کند.',
+      'outbound-socket': 'سرور نتوانست سوکت خروجی باز کند.',
+      'outbound-connect': 'سرور نتوانست اتصال TCP به مقصد آزمایشی برقرار کند.',
+      'upstream-empty': 'TCP وصل شد اما مقصد قبل از ارسال داده ارتباط را بست.',
+      'websocket-protocol': 'سرور در پردازش بستهٔ WebSocket خطا گرفت.',
+      'tunnel-runtime': 'اجرای تونل با خطا روبه‌رو شد. Logs اپ را بررسی کن.',
+      'relay-io': 'در خواندن یا نوشتن سوکت خطا رخ داد. Logs اپ را بررسی کن.',
+    };
+    const reason = Object.hasOwn(byReason, event.reason) ? byReason[event.reason] : '';
+    const fallback = connected
+      ? 'TCP به مقصد وصل شد اما پاسخ HTTP نرسید.'
+      : upgraded ? 'WebSocket باز شد و قبل از تأیید اتصال خروجی بسته شد.' : 'WebSocket باز نشد.';
+    finish(`${reason || fallback} کد ${event.code}`);
   });
 });
 
