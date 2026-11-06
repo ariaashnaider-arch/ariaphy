@@ -1,192 +1,269 @@
 #!/usr/bin/env python3
-import argparse
-import fcntl
-import hashlib
-import http.client
-import lzma
-import os
-from pathlib import Path, PurePosixPath
-import platform
-import shutil
-import sys
-import tarfile
-import tempfile
-from urllib.request import urlopen
+"""Aria Wasmer web panel and private VLESS WebSocket endpoint."""
 
+import base64
+from collections import deque
+from http.cookies import CookieError, SimpleCookie
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
+from pathlib import Path
+import sys
+from threading import BoundedSemaphore, Lock
+import time
 
 ROOT = Path(__file__).resolve().parent
-PAYLOAD = ROOT / "runtime"
-PANEL_NAME = "ariaatashin-linux-amd64"
-ENGINE_VERSION = "3.8.5"
-ENGINE_ARCHIVE = "x-ui-linux-amd64.tar.gz"
-ENGINE_URL = (
-    "https://github.com/MHSanaei/3x-ui/releases/download/"
-    f"v{ENGINE_VERSION}/{ENGINE_ARCHIVE}"
-)
-ENGINE_DIGEST = "6a85c110a04a727613c933c54ae602b8d37dab8876c6e20a6d46623010dd9d3c"
-ENGINE_PROGRAMS = ("x-ui", "bin/xray-linux-amd64")
-ENGINE_FILES = (*ENGINE_PROGRAMS, "bin/geoip.dat", "bin/geosite.dat")
-CHUNK_SIZE = 1024 * 1024
-MAX_ENGINE_ARCHIVE = 140 * CHUNK_SIZE
-MAX_ENGINE_FILES = 650 * CHUNK_SIZE
-MAX_PANEL_FILE = 120 * CHUNK_SIZE
+sys.path.insert(0, str(ROOT / "vendor"))
+
+import h11
+from wsproto import ConnectionType, WSConnection
+from wsproto.events import AcceptConnection
+from wsproto.utilities import LocalProtocolError, RemoteProtocolError
+
+from edge_config import EdgeConfig, SESSION_SECONDS, WS_PATH
+from edge_tunnel import relay
+
+SESSION_COOKIE = "__Host-aria_session"
+MAX_JSON = 4096
+STATIC_ROOT = ROOT / "static"
+ASSETS = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/static/style.css": ("style.css", "text/css; charset=utf-8"),
+    "/static/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "/static/keys.js": ("keys.js", "text/javascript; charset=utf-8"),
+    "/static/qr.js": ("qr.js", "text/javascript; charset=utf-8"),
+    "/static/flame.svg": ("flame.svg", "image/svg+xml"),
+    "/static/vazirmatn.woff2": ("vazirmatn.woff2", "font/woff2"),
+}
 
 
-def digest_stream(source, output=None, limit=None):
-    digest = hashlib.sha256()
-    size = 0
-    for chunk in iter(lambda: source.read(CHUNK_SIZE), b""):
-        size += len(chunk)
-        if limit is not None and size > limit:
-            raise RuntimeError("The runtime file exceeds its size limit.")
-        digest.update(chunk)
-        if output is not None:
-            output.write(chunk)
-    return digest.hexdigest()
+class Server(ThreadingHTTPServer):
+    request_queue_size = 32
+    daemon_threads = True
+
+    def __init__(self, address, config):
+        self.config = config
+        self.assets = {
+            url: ((STATIC_ROOT / path).read_bytes(), mime)
+            for url, (path, mime) in ASSETS.items()
+        }
+        self.workers = BoundedSemaphore(24)
+        self.tunnels = BoundedSemaphore(12)
+        self.login_lock = Lock()
+        self.failures = deque()
+        super().__init__(address, Handler)
+
+    def process_request(self, request, client_address):
+        if not self.workers.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.workers.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.workers.release()
+
+    def authenticate(self, password):
+        now = time.monotonic()
+        with self.login_lock:
+            while self.failures and self.failures[0] <= now - 45:
+                self.failures.popleft()
+            if len(self.failures) >= 14:
+                return 429
+            if self.config.check_password(password):
+                return 200
+            self.failures.append(now)
+            return 401
 
 
-def sha256(path):
-    with path.open("rb") as source:
-        return digest_stream(source)
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "AriaWasmer/1.0"
+    sys_version = ""
+    timeout = 8
+    # The upgrade switches to socket reads, so don't buffer bytes past HTTP headers.
+    rbufsize = 0
 
+    def log_message(self, *_args):
+        pass
 
-def panel_ready(path, expected):
-    return path.is_file() and os.access(path, os.X_OK) and sha256(path) == expected
+    @property
+    def config(self):
+        return self.server.config
 
+    def send_bytes(self, status, body, mime, extra=()):
+        self.close_connection = True
+        self.send_response(status)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+            "font-src 'self'; connect-src 'self' wss:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+        )
+        for name, value in extra:
+            self.send_header(name, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
-def prepare_panel(runtime, destination, expected):
-    with tempfile.TemporaryDirectory(prefix=".panel-", dir=runtime) as staging:
-        binary = Path(staging) / PANEL_NAME
-        with lzma.open(PAYLOAD / f"{PANEL_NAME}.xz", "rb") as source, binary.open("xb") as out:
-            if digest_stream(source, out, MAX_PANEL_FILE) != expected:
-                raise RuntimeError("The packaged panel checksum did not match.")
-        binary.chmod(0o700)
-        binary.replace(destination)
+    def send_json(self, status, value, extra=()):
+        body = json.dumps(value, ensure_ascii=False).encode("utf-8")
+        self.send_bytes(status, body, "application/json; charset=utf-8", extra)
 
+    def error(self, status, message, extra=()):
+        self.send_json(status, {"error": message}, extra)
 
-def check_engine(path):
-    for name in ENGINE_FILES:
-        file = path / name
-        if not file.is_file() or file.stat().st_size == 0:
-            raise RuntimeError(f"Engine v{ENGINE_VERSION} is missing {name}.")
-    for name in ENGINE_PROGRAMS:
-        if not os.access(path / name, os.X_OK):
-            raise RuntimeError(f"The host cannot execute {path / name}.")
+    def logged_in(self):
+        try:
+            cookie = SimpleCookie(self.headers.get("Cookie", ""))
+        except CookieError:
+            return False
+        entry = cookie.get(SESSION_COOKIE)
+        return entry is not None and self.config.valid_session(entry.value)
 
+    def session_cookie(self, value, seconds):
+        return ("Set-Cookie", f"{SESSION_COOKIE}={value}; Path=/; Max-Age={seconds}; Secure; HttpOnly; SameSite=Strict")
 
-def unpack_engine(archive, output):
-    total_size = 0
-    with tarfile.open(archive, mode="r:gz") as source:
-        for member in source:
-            path = PurePosixPath(member.name)
-            if not path.parts or path.parts[0] != "x-ui" or ".." in path.parts:
-                raise RuntimeError("Unexpected path in the 3x-ui archive.")
-            if member.isdir():
-                (output.joinpath(*path.parts[1:])).mkdir(parents=True, exist_ok=True)
-                continue
-            if len(path.parts) < 2 or not member.isfile():
-                raise RuntimeError("Unexpected entry in the 3x-ui archive.")
-            total_size += member.size
-            if member.size < 0 or total_size > MAX_ENGINE_FILES:
-                raise RuntimeError("The 3x-ui archive exceeds its extraction limit.")
-            file = output.joinpath(*path.parts[1:])
-            file.parent.mkdir(parents=True, exist_ok=True)
-            with source.extractfile(member) as entry, file.open("xb") as target:
-                shutil.copyfileobj(entry, target)
-            file.chmod(0o700 if member.mode & 0o111 else 0o600)
+    def do_HEAD(self):
+        self.do_GET()
 
-
-def prepare_engine(runtime, engine, env):
-    override = env.get("ARIA_ENGINE_ARCHIVE")
-    local_archive = Path(override).expanduser() if override else PAYLOAD / ENGINE_ARCHIVE
-    with tempfile.TemporaryDirectory(prefix=".engine-", dir=runtime) as staging:
-        staging = Path(staging)
-        verified_archive = staging / ENGINE_ARCHIVE
-        if override or local_archive.is_file():
-            source = local_archive.open("rb")
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path == WS_PATH and self.command == "GET":
+            self.websocket()
+            return
+        asset = self.server.assets.get(path)
+        if asset is not None:
+            body, mime = asset
+            self.send_bytes(200, body, mime)
+        elif path == "/health":
+            self.send_json(200, {"app": "aria-wasmer", "configured": self.config.ready, "transport": "vless-ws-tcp"})
+        elif path == "/api/session":
+            self.send_json(200, {
+                "configured": self.config.ready, "missing": self.config.errors,
+                "authenticated": self.logged_in(), "host": self.config.host, "wsPath": WS_PATH,
+            })
         else:
-            print(f"Downloading pinned 3x-ui v{ENGINE_VERSION} from GitHub.", flush=True)
+            self.error(404, "این مسیر وجود ندارد.")
+
+    def read_json(self):
+        if self.headers.get("Transfer-Encoding") or self.headers.get_content_type() != "application/json":
+            raise ValueError("expected JSON body")
+        length = self.headers.get_all("Content-Length", [])
+        if len(length) != 1 or not length[0].isascii() or not length[0].isdigit():
+            raise ValueError("invalid body length")
+        remaining = int(length[0])
+        if not 1 <= remaining <= MAX_JSON:
+            raise ValueError("invalid body length")
+        data = bytearray()
+        while remaining:
+            chunk = self.rfile.read(remaining)
+            if not chunk:
+                raise ValueError("incomplete body")
+            data.extend(chunk)
+            remaining -= len(chunk)
+        result = json.loads(data)
+        if not isinstance(result, dict):
+            raise ValueError("expected JSON object")
+        return result
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        if path not in ("/api/login", "/api/logout", "/api/issue"):
+            self.error(404, "این مسیر وجود ندارد.")
+            return
+        if not self.config.ready:
+            self.error(503, "متغیرهای راه‌اندازی هنوز کامل نیستند.")
+            return
+        if self.headers.get_all("Origin", []) != [self.config.origin]:
+            self.error(403, "دامنهٔ درخواست با ARIA_PUBLIC_HOST مطابقت ندارد.")
+            return
+        if path != "/api/login" and not self.logged_in():
+            self.error(401, "ابتدا وارد پنل شو.")
+            return
+        try:
+            body = self.read_json()
+        except (ValueError, OSError):
+            self.error(400, "دادهٔ درخواست معتبر نیست.")
+            return
+        if path == "/api/login":
+            self.login(body)
+        elif path == "/api/logout":
+            self.send_json(200, {"ok": True}, [self.session_cookie("", 0)])
+        else:
             try:
-                source = urlopen(ENGINE_URL, timeout=35)
-            except OSError as error:
-                raise RuntimeError(
-                    "Unable to download the official 3x-ui engine. "
-                    f"Place {ENGINE_ARCHIVE} in runtime/ and try again."
-                ) from error
-        with source, verified_archive.open("xb") as target:
-            if digest_stream(source, target, MAX_ENGINE_ARCHIVE) != ENGINE_DIGEST:
-                raise RuntimeError("The official 3x-ui archive checksum did not match.")
+                result = self.config.issue(body.get("name"), body.get("days"))
+            except ValueError as error:
+                self.error(400, str(error))
+                return
+            self.send_json(201, result)
 
-        extracted = staging / "engine"
-        extracted.mkdir()
-        unpack_engine(verified_archive, extracted)
-        check_engine(extracted)
-        extracted.replace(engine)
+    def login(self, body):
+        password = body.get("password")
+        if not isinstance(password, str) or len(password) > 256:
+            self.error(400, "رمز معتبر وارد کن.")
+            return
+        status = self.server.authenticate(password)
+        if status == 429:
+            self.error(status, "چند لحظه صبر کن و دوباره وارد شو.", [("Retry-After", "45")])
+        elif status == 401:
+            self.error(status, "رمز مدیر درست نیست.")
+        else:
+            self.send_json(200, {"ok": True}, [self.session_cookie(self.config.new_session(), SESSION_SECONDS)])
 
+    def upgrade(self):
+        keys = self.headers.get_all("Sec-WebSocket-Key", [])
+        if len(keys) != 1 or len(base64.b64decode(keys[0], validate=True)) != 16:
+            raise ValueError("invalid websocket key")
+        if self.headers.get("Transfer-Encoding") or self.headers.get("Content-Length", "0") != "0":
+            raise ValueError("unexpected websocket request body")
+        protocol = WSConnection(ConnectionType.SERVER)
+        names = ("Host", "Upgrade", "Connection", "Sec-WebSocket-Key", "Sec-WebSocket-Version")
+        headers = [(name.lower().encode("ascii"), value.encode("ascii"))
+                   for name in names for value in self.headers.get_all(name, [])]
+        protocol.initiate_upgrade_connection(headers, WS_PATH)
+        return protocol, protocol.send(AcceptConnection())
 
-def prepare_runtime(env):
-    runtime = Path(env.get("ARIA_RUNTIME_DIR") or ROOT / ".aria-runtime").expanduser().resolve()
-    panel = runtime / PANEL_NAME
-    provided_engine = env.get("ARIA_ENGINE_DIR") or env.get("ATIA_ENGINE_DIR")
-    engine = Path(provided_engine).expanduser().resolve() if provided_engine else runtime / f"engine-{ENGINE_VERSION}"
-    tools = runtime / "bin"
-    sqlite = tools / "sqlite3"
-    expected = (PAYLOAD / f"{PANEL_NAME}.sha256").read_text(encoding="ascii").strip()
-    if provided_engine or engine.exists():
-        check_engine(engine)
-        if panel_ready(panel, expected) and sqlite.is_file() and os.access(sqlite, os.X_OK):
-            return panel, engine, tools
-
-    runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with (runtime / "prepare.lock").open("ab") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        if not panel_ready(panel, expected):
-            prepare_panel(runtime, panel, expected)
-        if not provided_engine and not engine.exists():
-            prepare_engine(runtime, engine, env)
-        check_engine(engine)
-        tools.mkdir(mode=0o700, exist_ok=True)
-        if not sqlite.is_file() or not os.access(sqlite, os.X_OK):
-            with tempfile.TemporaryDirectory(prefix=".sqlite-", dir=runtime) as staging:
-                shim = Path(staging) / "sqlite3"
-                shutil.copyfile(PAYLOAD / "sqlite3-shim", shim)
-                shim.chmod(0o700)
-                shim.replace(sqlite)
-    return panel, engine, tools
+    def websocket(self):
+        if not self.config.ready:
+            self.error(503, "متغیرهای راه‌اندازی هنوز کامل نیستند.")
+            return
+        if not self.server.tunnels.acquire(blocking=False):
+            self.error(503, "ظرفیت اتصال موقتاً تکمیل است.")
+            return
+        self.close_connection = True
+        try:
+            try:
+                protocol, response = self.upgrade()
+            except (ValueError, h11.ProtocolError, LocalProtocolError, RemoteProtocolError):
+                self.error(400, "درخواست ارتقای WebSocket معتبر نیست.")
+                return
+            self.connection.sendall(response)
+            relay(self.connection, protocol, self.config)
+        except OSError:
+            pass
+        finally:
+            self.server.tunnels.release()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run the ariaatashin 4.11.1 panel with Python.")
-    parser.add_argument("--prepare", action="store_true", help="Prepare the Linux runtime without starting the panel.")
-    args = parser.parse_args()
-    if sys.platform != "linux" or platform.machine().lower() not in {"x86_64", "amd64"}:
-        raise RuntimeError("This package requires a Linux x86_64 host.")
-
-    env = os.environ.copy()
-    if not args.prepare:
-        password = env.get("ARIA_ADMIN_PASSWORD") or env.get("ATIA_ADMIN_PASSWORD", "")
-        if len(password.strip()) < 12 or len(password.encode()) > 256:
-            raise RuntimeError("Set ARIA_ADMIN_PASSWORD to a private password of at least 12 characters and at most 256 UTF-8 bytes.")
-
-    panel, engine, tools = prepare_runtime(env)
-    if args.prepare:
-        print("Panel and 3x-ui runtime are ready.", flush=True)
-        return
-
-    env["ARIA_ENGINE_DIR"] = str(engine)
-    env["ARIA_SQLITE_PYTHON"] = sys.executable
-    env["ARIA_SQLITE_HELPER"] = str(PAYLOAD / "sqlite_helper.py")
-    env["PATH"] = os.pathsep.join((str(tools), env.get("PATH") or os.defpath))
-    for binary, key in (("sing-box", "ARIA_SING_BOX_BIN"), ("ookla-speedtest", "ARIA_SPEEDTEST_BIN")):
-        local = PAYLOAD / binary
-        if local.is_file():
-            env.setdefault(key, str(local))
-    os.execve(panel, [str(panel)], env)
+    config = EdgeConfig()
+    port = int(os.environ.get("PORT") or "80")
+    with Server(("0.0.0.0", port), config) as server:
+        print(f"Aria Wasmer listening on {port}; configured={config.ready}", flush=True)
+        server.serve_forever()
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except (OSError, ValueError, RuntimeError, lzma.LZMAError, tarfile.TarError, http.client.HTTPException) as error:
-        print(f"ariaatashin: {error}", file=sys.stderr)
-        sys.exit(1)
+    main()
