@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Aria · Wasmer</title>
+  <link rel="icon" href="/static/flame.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+  <script defer src="/static/qr.js"></script>
+  <script defer src="/static/keys.js"></script>
+  <script defer src="/static/app.js"></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="masthead">
+      <div class="brand"><img src="/static/flame.svg" width="46" height="46" alt=""><div><strong dir="ltr">ARIA<span>.</span></strong><small>نسخهٔ Wasmer</small></div></div>
+      <span class="tag" dir="ltr">VLESS / WS / TLS</span>
+    </header>
+    <div id="page-status" class="notice" role="status">در حال بررسی وضعیت پنل…</div>
+
+    <section id="setup" class="card narrow" hidden>
+      <p class="eyebrow">راه‌اندازی اولیه</p>
+      <h1>متغیرهای برنامه را تنظیم کن</h1>
+      <p>مقادیر زیر را در بخش Environment variables اپ قرار بده و دوباره Deploy کن.</p>
+      <code class="block" id="missing" dir="ltr"></code>
+      <div class="keygen" data-keygen>
+        <button class="secondary" type="button" data-generate>تولید رمز و کلید خصوصی</button>
+        <div data-values hidden>
+          <label><code dir="ltr">ARIA_ADMIN_PASSWORD</code><input data-password dir="ltr" readonly autocomplete="off"></label>
+          <label><code dir="ltr">ARIA_SIGNING_KEY</code><input data-signing-key dir="ltr" readonly autocomplete="off"></label>
+          <p class="hint">مقادیر در همین مرورگر تولید می‌شوند. آن‌ها را فقط در متغیرهای خصوصی Wasmer ثبت کن.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="login" class="card narrow" hidden>
+      <p class="eyebrow">ورود مدیر</p>
+      <h1>پنل اتصال آریا</h1>
+      <form id="login-form">
+        <label>رمز مدیر<input name="password" type="password" dir="ltr" required maxlength="256" autocomplete="current-password"></label>
+        <button type="submit">ورود به پنل</button>
+      </form>
+    </section>
+
+    <section id="dashboard" hidden>
+      <div class="hero card">
+        <div><p class="eyebrow">اتصال شخصی</p><h1>ساخت کانفیگ VLESS</h1><p>لینک با اعتبار زمانی و QR برای کلاینت خودت بساز.</p></div>
+        <button id="logout" class="secondary" type="button">خروج</button>
+      </div>
+      <div class="grid">
+        <section class="card">
+          <h2>کانفیگ جدید</h2>
+          <form id="issue-form">
+            <label>نام اتصال<input name="name" value="Aria Wasmer" required maxlength="64"></label>
+            <label>اعتبار به روز<input name="days" type="number" dir="ltr" min="1" max="90" value="30" required></label>
+            <button type="submit">ساخت لینک و QR</button>
+          </form>
+        </section>
+        <section class="card details">
+          <h2>تنظیمات اتصال</h2>
+          <dl>
+            <div><dt>دامنه</dt><dd><code id="host" dir="ltr"></code></dd></div>
+            <div><dt>مسیر</dt><dd><code id="path" dir="ltr"></code></dd></div>
+            <div><dt>پورت عمومی</dt><dd><code dir="ltr">443</code></dd></div>
+            <div><dt>انتقال</dt><dd><code dir="ltr">WebSocket + TLS</code></dd></div>
+          </dl>
+          <p class="hint">اتصال این نسخه برای TCP وب است. در کلاینت، Flow و Mux را غیرفعال کن.</p>
+        </section>
+      </div>
+      <section id="result" class="card result" hidden>
+        <div>
+          <p class="eyebrow">کانفیگ آماده است</p>
+          <h2 id="profile-name"></h2>
+          <p id="expiry" class="hint"></p>
+          <label>لینک اتصال<textarea id="profile-link" dir="ltr" readonly spellcheck="false" rows="3"></textarea></label>
+          <div class="actions">
+            <button id="copy" type="button">کپی لینک</button>
+            <button id="download" class="secondary" type="button">دانلود TXT</button>
+            <button id="test" class="secondary" type="button">تست اتصال</button>
+          </div>
+          <p id="test-result" class="hint" role="status"></p>
+        </div>
+        <img id="profile-qr" class="qr" width="180" height="180" alt="کد QR کانفیگ VLESS">
+      </section>
+    </section>
+  </main>
+</body>
+</html>
