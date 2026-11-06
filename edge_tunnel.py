@@ -1,9 +1,10 @@
 """VLESS v0 TCP sessions transported as WebSocket binary data."""
 
 from dataclasses import dataclass
-from ipaddress import IPv4Address
-import selectors
+from ipaddress import AddressValueError, IPv4Address
 import socket
+import sys
+from threading import Event, Lock, Thread
 import time
 
 from wsproto.connection import ConnectionState
@@ -14,6 +15,7 @@ from edge_config import valid_domain
 
 CHUNK = 32768
 HEADER_TIMEOUT = 10
+IO_TIMEOUT = 4
 IDLE_SECONDS = 120
 MAX_SESSION_SECONDS = 900
 ALLOWED_PORTS = (80, 443)
@@ -21,6 +23,12 @@ ALLOWED_PORTS = (80, 443)
 
 class TunnelPolicyError(ValueError):
     pass
+
+
+class OutboundError(OSError):
+    def __init__(self, reason, cause):
+        super().__init__(getattr(cause, "errno", None), reason)
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -65,44 +73,83 @@ def read_target(data):
 
 def connect_public(host, port):
     # Resolve once, then dial the exact validated IP to avoid a second lookup.
-    addresses = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-    targets = dict.fromkeys(address for _, _, _, _, address in addresses)
+    try:
+        address = IPv4Address(host)
+    except AddressValueError:
+        try:
+            addresses = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        except (OSError, NotImplementedError) as error:
+            raise OutboundError("outbound-dns", error) from error
+        targets = dict.fromkeys(endpoint for _, _, _, _, endpoint in addresses)
+    else:
+        targets = ((str(address), port),)
     public = []
-    for address in targets:
-        ip = IPv4Address(address[0])
+    for endpoint in targets:
+        ip = IPv4Address(endpoint[0])
         if ip.is_global and not ip.is_multicast and not ip.is_reserved:
-            public.append(address)
+            public.append(endpoint)
     if not public:
         raise TunnelPolicyError("destination is not a public IPv4 address")
-    for address in public[:3]:
-        upstream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    last_error = None
+    for endpoint in public[:3]:
         try:
-            upstream.settimeout(4)
-            upstream.connect(address)
-            upstream.settimeout(8)
+            upstream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        except (OSError, NotImplementedError) as error:
+            raise OutboundError("outbound-socket", error) from error
+        try:
+            upstream.settimeout(IO_TIMEOUT)
+            upstream.connect(endpoint)
             return upstream
-        except OSError:
+        except (OSError, NotImplementedError) as error:
+            last_error = error
             upstream.close()
-    raise OSError("outbound connection failed")
+    raise OutboundError("outbound-connect", last_error) from last_error
 
 
 def close_frame(client, protocol, code, reason=""):
     if protocol.state in (ConnectionState.OPEN, ConnectionState.REMOTE_CLOSING):
         try:
             client.sendall(protocol.send(CloseConnection(code, reason)))
-        except (OSError, LocalProtocolError):
+        except (OSError, LocalProtocolError, NotImplementedError):
             pass
 
 
 class Tunnel:
-    def __init__(self, client, protocol, config, selector):
+    def __init__(self, client, protocol, config):
         self.client = client
         self.protocol = protocol
         self.config = config
-        self.selector = selector
         self.upstream = None
+        self.downstream = None
         self.header = bytearray()
         self.expires = None
+        self.stopped = Event()
+        self.ws_lock = Lock()
+        self.started = self.last_activity = time.monotonic()
+        self.phase = "vless-header"
+
+    def send(self, event):
+        with self.ws_lock:
+            if self.stopped.is_set() or self.protocol.state != ConnectionState.OPEN:
+                return False
+            self.client.sendall(self.protocol.send(event))
+        return True
+
+    def finish(self, code, reason, error=None):
+        with self.ws_lock:
+            if self.stopped.is_set():
+                return
+            self.stopped.set()
+            if code != 1000 or self.phase != "relay" or reason == "upstream-empty":
+                # Log the phase only. Client credentials and traffic stay out of logs.
+                detail = f" error={type(error).__name__}" if error is not None else ""
+                errno = getattr(error, "errno", None)
+                if isinstance(errno, int):
+                    detail += f" errno={errno}"
+                print(f"aria tunnel phase={self.phase} close={code} reason={reason}{detail}",
+                      file=sys.stderr, flush=True)
+            close_frame(self.client, self.protocol, code, reason)
 
     def binary(self, data):
         if self.upstream is not None:
@@ -114,75 +161,116 @@ class Tunnel:
         if self.expires is None:
             self.expires = self.config.client_expiry(bytes(self.header[1:17]))
             if self.expires is None:
-                raise TunnelPolicyError("invalid or expired connection")
+                self.finish(1008, "invalid-profile")
+                return
         target = read_target(self.header)
         if target is None:
             return
+        self.phase = "outbound"
         self.upstream = connect_public(target.host, target.port)
-        self.selector.register(self.upstream, selectors.EVENT_READ, "outbound")
-        self.client.sendall(self.protocol.send(BytesMessage(data=b"\x00\x00")))
+        self.last_activity = time.monotonic()
+        self.phase = "relay"
+        if not self.send(BytesMessage(data=b"\x00\x00")):
+            self.finish(1000, "client-closed")
+            return
+        # One reader per socket avoids polling both WASIX sockets in one selector.
+        worker = Thread(target=self.receive_outbound, daemon=True)
+        worker.start()
+        self.downstream = worker
         if len(self.header) > target.payload_offset:
             self.upstream.sendall(self.header[target.payload_offset:])
         self.header.clear()
 
-    def receive_client(self):
-        data = self.client.recv(CHUNK)
-        if not data:
-            return False
-        self.protocol.receive_data(data)
-        for event in self.protocol.events():
+    def receive_client(self, data):
+        with self.ws_lock:
+            self.protocol.receive_data(data)
+            events = self.protocol.events()
+        while not self.stopped.is_set():
+            with self.ws_lock:
+                event = next(events, None)
+                state = self.protocol.state
+            if event is None:
+                break
             if isinstance(event, BytesMessage):
                 self.binary(event.data)
             elif isinstance(event, Ping):
-                self.client.sendall(self.protocol.send(event.response()))
+                self.send(event.response())
             elif isinstance(event, TextMessage):
-                close_frame(self.client, self.protocol, 1003, "binary data required")
-                return False
+                self.finish(1003, "binary-required")
             elif isinstance(event, CloseConnection):
                 code = event.code if event.code not in (1005, 1006, 1015) else 1000
-                close_frame(self.client, self.protocol, code)
-                return False
-        return True
+                reason = "websocket-protocol" if state == ConnectionState.OPEN else "client-closed"
+                self.finish(code, reason)
 
     def receive_outbound(self):
-        chunk = self.upstream.recv(CHUNK)
-        if not chunk:
-            close_frame(self.client, self.protocol, 1000)
-            return False
-        self.client.sendall(self.protocol.send(BytesMessage(data=chunk)))
-        return True
+        received = False
+        try:
+            while not self.stopped.is_set():
+                try:
+                    chunk = self.upstream.recv(CHUNK)
+                except TimeoutError:
+                    continue
+                if not chunk:
+                    self.finish(1000, "upstream-eof" if received else "upstream-empty")
+                    return
+                received = True
+                self.last_activity = time.monotonic()
+                if not self.send(BytesMessage(data=chunk)):
+                    return
+        except (OSError, LocalProtocolError) as error:
+            self.finish(1011, "relay-io", error)
+        except Exception as error:
+            self.finish(1011, "tunnel-runtime", error)
 
     def run(self):
-        started = time.monotonic()
-        idle_limit = started + HEADER_TIMEOUT
-        self.selector.register(self.client, selectors.EVENT_READ, "client")
-        while True:
+        self.client.settimeout(IO_TIMEOUT)
+        while not self.stopped.is_set():
             now = time.monotonic()
-            remaining = min(idle_limit - now, started + MAX_SESSION_SECONDS - now)
-            if self.expires is not None:
-                remaining = min(remaining, self.expires - time.time())
-            if remaining <= 0:
-                close_frame(self.client, self.protocol, 1000, "session ended")
+            if self.upstream is None and now - self.started >= HEADER_TIMEOUT:
+                self.finish(1008, "header-timeout" if self.header else "first-frame-timeout")
                 return
-            for key, _ in self.selector.select(remaining):
-                keep_open = self.receive_client() if key.data == "client" else self.receive_outbound()
-                if not keep_open:
-                    return
-                if self.upstream is not None:
-                    idle_limit = time.monotonic() + IDLE_SECONDS
+            if self.expires is not None and time.time() >= self.expires:
+                self.finish(1008, "expired-profile")
+                return
+            if now - self.last_activity >= IDLE_SECONDS or now - self.started >= MAX_SESSION_SECONDS:
+                self.finish(1000, "session-ended")
+                return
+            try:
+                data = self.client.recv(CHUNK)
+            except TimeoutError:
+                continue
+            if not data:
+                self.finish(1000, "client-eof")
+                return
+            self.last_activity = time.monotonic()
+            self.receive_client(data)
+
+    def cleanup(self):
+        self.stopped.set()
+        if self.upstream is None:
+            return
+        try:
+            self.upstream.shutdown(socket.SHUT_RDWR)
+        except (OSError, NotImplementedError):
+            pass
+        if self.downstream is not None:
+            self.downstream.join(IO_TIMEOUT + 1)
+        self.upstream.close()
 
 
 def relay(client, protocol, config):
-    with selectors.DefaultSelector() as selector:
-        tunnel = Tunnel(client, protocol, config, selector)
-        try:
-            tunnel.run()
-        except TunnelPolicyError:
-            close_frame(client, protocol, 1008, "connection rejected")
-        except (LocalProtocolError, RemoteProtocolError):
-            close_frame(client, protocol, 1002, "invalid websocket data")
-        except OSError:
-            close_frame(client, protocol, 1011, "connection unavailable")
-        finally:
-            if tunnel.upstream is not None:
-                tunnel.upstream.close()
+    tunnel = Tunnel(client, protocol, config)
+    try:
+        tunnel.run()
+    except TunnelPolicyError:
+        tunnel.finish(1008, "connection-rejected")
+    except OutboundError as error:
+        tunnel.finish(1011, error.reason, error)
+    except (LocalProtocolError, RemoteProtocolError) as error:
+        tunnel.finish(1002, "websocket-protocol", error)
+    except OSError as error:
+        tunnel.finish(1011, "relay-io", error)
+    except Exception as error:
+        tunnel.finish(1011, "tunnel-runtime", error)
+    finally:
+        tunnel.cleanup()
