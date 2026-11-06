@@ -1,4 +1,4 @@
-"""VLESS v0 TCP sessions transported as WebSocket binary data."""
+"""VLESS v0 web traffic and DNS transported as WebSocket binary data."""
 
 from dataclasses import dataclass
 from ipaddress import AddressValueError, IPv4Address
@@ -18,7 +18,11 @@ HEADER_TIMEOUT = 10
 IO_TIMEOUT = 4
 IDLE_SECONDS = 120
 MAX_SESSION_SECONDS = 900
-ALLOWED_PORTS = (80, 443)
+WEB_PORTS = (80, 443)
+DNS_PORT = 53
+DNS_RESOLVERS = frozenset(IPv4Address(ip) for ip in (
+    "1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4",
+))
 
 
 class TunnelPolicyError(ValueError):
@@ -45,11 +49,14 @@ def read_target(data):
         raise TunnelPolicyError("VLESS v0 without Flow or addons is required")
     if len(data) < 22:
         return None
-    if data[18] != 1:
-        raise TunnelPolicyError("only TCP is supported")
+    command = data[18]
+    if command not in (1, 2):
+        raise TunnelPolicyError("only TCP and DNS are supported")
     port = int.from_bytes(data[19:21], "big")
-    if port not in ALLOWED_PORTS:
+    if port != DNS_PORT and (command != 1 or port not in WEB_PORTS):
         raise TunnelPolicyError("destination port is not allowed")
+    # VLESS UDP and DNS over TCP both prefix each DNS message with its
+    # two-byte length. The same stream relay serves both VLESS DNS commands.
     kind = data[21]
     if kind == 1:
         if len(data) < 26:
@@ -86,10 +93,12 @@ def connect_public(host, port):
     public = []
     for endpoint in targets:
         ip = IPv4Address(endpoint[0])
+        if port == DNS_PORT and ip not in DNS_RESOLVERS:
+            continue
         if ip.is_global and not ip.is_multicast and not ip.is_reserved:
             public.append(endpoint)
     if not public:
-        raise TunnelPolicyError("destination is not a public IPv4 address")
+        raise TunnelPolicyError("destination is not an allowed public IPv4 address")
 
     last_error = None
     for endpoint in public[:3]:
@@ -166,7 +175,7 @@ class Tunnel:
         target = read_target(self.header)
         if target is None:
             return
-        self.phase = "outbound"
+        self.phase = "dns-outbound" if target.port == DNS_PORT else "outbound"
         self.upstream = connect_public(target.host, target.port)
         self.last_activity = time.monotonic()
         self.phase = "relay"
